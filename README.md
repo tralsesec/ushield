@@ -10,20 +10,21 @@
 
 ```text
 ┌─────────────────────────────────────────────────────────────────────────┐
-│ USERSPACE (ushieldd - Pure C11 Static Binary, ~2MB)                     │
+│ USERSPACE (ushieldd - Low-Privileged User Space Daemon)                 │
 │                                                                         │
-│  [ ushield.conf ] ──► [ HTTP/REST API + Embedded Web UI ]               │
-│                            │ (Upload, Management, Live Streaming)       │
-│                            └── Task Router & Namespace Controller       │
-└────────────────────────────┼────────────────────────────────────────────┘
-                             │  /dev/ushield (Zero-Copy mmap Ring Buffer)
-                             │  Custom Syscalls (e.g., sys_shield_seal)
-┌────────────────────────────┴────────────────────────────────────────────┘
-│ KERNELSPACE (ushield.ko - LKM + eBPF LSM in Ring 0)                     │
+│  [ HTTP / Web UI ] ──► Low-priv user (e.g., uid 1000 / 'ushield' user)  │
+│                         │                                               │
+│                         └── Opens /dev/ushield and sends ioctl() /      │
+│                         │   custom syscall requests with sandbox params │
+└─────────────────────────┼───────────────────────────────────────────────┘
+                          │ /dev/ushield (Device Node Access)
+┌─────────────────────────┴───────────────────────────────────────────────┐
+│ KERNELSPACE (ushield.ko - Ring 0 Privileged Control Plane)              │
 │                                                                         │
-│  [ Custom Syscalls ] ──► Atomic Nanosecond Process Seal                 │
-│  [ eBPF LSM Hooks ]  ──► Dynamic Syscall Whitelisting / Blacklisting    │
-│  [ Ring Buffer ]     ──► Zero-Copy Telemetry Stream via Shared Memory   │
+│  • Validates caller credentials (struct cred)                           │
+│  • Performs process containment & namespace/task restrictions           │
+│  • Intercepts & Whitelists Syscalls via eBPF LSM                        │
+│  • Executes Atomic Nanosecond Lockdown (sys_shield_seal)                │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -33,24 +34,24 @@
 
 ### 1. Minimalist User-Space Controller (`ushieldd`)
 
-* **Zero External Dependencies:** Statistically linked C11 binary.
-* **Embedded Control Plane:** HTTP/REST API server delivering an embedded Single-Page Web UI directly from C bytecode.
-* **Zero-DB Architecture:** Simple file-based configuration via `ushield.conf`. Authentication uses single-tenant admin credentials yielding high-entropy, randomly generated session tokens.
-* **Full Process & Binary Lifecycle:** Upload targets, download binaries/artifacts, configure sandboxes, stream analysis logs, and interact with live execution streams.
+- **Zero External Dependencies:** Statically linked C11 binary.
+- **Embedded Control Plane:** HTTP/REST API server delivering an embedded Single-Page Web UI directly from C bytecode.
+- **Zero-DB Architecture:** Simple file-based configuration via `ushield.conf`. Authentication uses single-tenant admin credentials yielding high-entropy, randomly generated session tokens.
+- **Full Process & Binary Lifecycle:** Upload targets, download binaries/artifacts, configure sandboxes, stream analysis logs, and interact with live execution streams.
 
 ### 2. Micro-Container & Asymmetric Namespace Isolation
 
-* **Asymmetric Visibility:** Target binaries execute within hyper-restricted, custom Linux namespaces (`CLONE_NEWPID`, `CLONE_NEWNET`, `CLONE_NEWNS`).
-* **Target View:** To the isolated binary, the environment appears as a completely stripped-down bare kernel—incapable of seeing system binaries (e.g., `/bin/sh` or host tooling).
-* **Controller View:** `ushieldd` retains top-down root visibility into the containerized process, allowing real-time command injection, dynamic memory manipulation, and direct kernel module debugging.
+- **Asymmetric Visibility:** Target binaries execute within hyper-restricted, custom Linux namespaces (`CLONE_NEWPID`, `CLONE_NEWNET`, `CLONE_NEWNS`).
+- **Target View:** Fully configurable process illusion. The execution space can be presented as an ultra-stripped-down bare kernel or mapped to simulate a full, standard Linux server environment. Supports both pre-built environment templates and custom `rootfs` profiles.
+- **Controller View:** `ushieldd` retains top-down root visibility into the containerized process, allowing real-time command injection, dynamic memory manipulation, and direct kernel module debugging.
 
 ### 3. Ring 0 Kernel Driver & Telemetry (`ushield.ko`)
 
-* **Shared Memory Inter-Process Communication (IPC):** Direct `/dev/ushield` character device offering `mmap` ring buffers for zero-copy, nanosecond telemetry streaming into user space.
-* **Instant Process Seal:** Custom atomic kernel call (`sys_shield_seal`) forcing nanosecond process locks without POSIX overhead.
-* **eBPF Syscall Filtering:** Real-time enforcement using Ring 0 LSM hooks:
-* **Granular Whitelisting/Blacklisting:** Block or allow specific syscall IDs.
-* **Preset Categories:** Quick rule application (e.g., `ALLOW_NET`, `DISALLOW_FS`, `RESTRICT_EXEC`).
+- **Shared Memory Inter-Process Communication (IPC):** Direct `/dev/ushield` character device offering `mmap` ring buffers for zero-copy, nanosecond telemetry streaming into user space.
+- **Instant Process Seal:** Custom atomic kernel call (`sys_shield_seal`) forcing nanosecond process locks without POSIX overhead.
+- **eBPF Syscall Filtering:** Real-time enforcement using Ring 0 LSM hooks:
+  1. **Granular Whitelisting/Blacklisting:** Block or allow specific syscall IDs.
+  2. **Preset Categories:** Quick rule template application (e.g., `ALLOW_NET`, `DISALLOW_FS`, `RESTRICT_EXEC`).
 
 ---
 
@@ -72,14 +73,14 @@ The REST API (and matching Web UI) exposes full operational control over the eng
 
 ## Development Roadmap & Future Architecture
 
-* [x] **Phase 0:** Project layout, Makefile build system, and isolated QEMU/KVM dev VM setup.
-* [ ] **Phase 1:** Bare-metal C daemon (`ushieldd`), `ushield.conf` parser, and embedded Web UI.
-* [ ] **Phase 2:** Core LKM skeleton (`ushield.ko`) & character device registration (`/dev/ushield`).
-* [ ] **Phase 3:** Zero-copy `mmap` ring buffer telemetry transport.
-* [ ] **Phase 4:** Asymmetric namespace isolation engine & `sys_shield_seal` implementation.
-* [ ] **Phase 5:** eBPF LSM syscall filtering (Category rules & explicit whitelists/blacklists).
-* [ ] **Phase 6 (Future):** *Behavioral Sequence Filtering* — Advanced workflow state machines in Ring 0 to evaluate execution sequences (e.g., allow `sys_A`, but terminate if followed immediately by `sys_B`).
-* [ ] **Phase 7 (Future):** Use [`asmhttp`](https://github.com/tralsesec/asmhttp) as http library when it is ready for production.
+- [x] **Phase 0:** Project layout, Makefile build system, and isolated QEMU/KVM dev VM setup.
+- [ ] **Phase 1:** Core LKM skeleton (`ushield.ko`) & character device registration (`/dev/ushield`).
+- [ ] **Phase 2:** Bare-metal C daemon (`ushieldd`), `ushield.conf` parser, and embedded Web UI.
+- [ ] **Phase 3:** Zero-copy `mmap` ring buffer telemetry transport.
+- [ ] **Phase 4:** Asymmetric namespace isolation engine & `sys_shield_seal` implementation.
+- [ ] **Phase 5:** eBPF LSM syscall filtering (Category rules & explicit whitelists/blacklists).
+- [ ] **Phase 6 (Future):** *Behavioral Sequence Filtering* — Advanced workflow state machines in Ring 0 to evaluate execution sequences (e.g., allow `sys_A`, but terminate if followed immediately by `sys_B`).
+- [ ] **Phase 7 (Future):** HTTP library replaced by [`asmhttp`](https://github.com/tralsesec/asmhttp) when ready for production.
 
 ---
 

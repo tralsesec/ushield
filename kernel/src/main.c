@@ -3,7 +3,7 @@
 #include <linux/module.h>
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("µShield Project");
+MODULE_AUTHOR("tralsesec");
 MODULE_DESCRIPTION("µShield Ring 0 Sandbox & Telemetry Module");
 MODULE_VERSION("0.1");
 
