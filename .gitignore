@@ -1,0 +1,31 @@
+# Executables & Binaries
+daemon/ushieldd
+dist/
+bin/
+
+# Object Files & Dependencies
+*.o
+*.o.d
+*.a
+*.so
+
+# Linux Kernel Build Artifacts (Kbuild)
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.cmd
+.*.cmd
+.tmp_versions/
+modules.order
+Module.symvers
+.module-common.o
+*.ko.cmd
+*.mod.cmd
+
+# Editors & OS Garbage
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
