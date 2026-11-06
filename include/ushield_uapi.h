@@ -12,13 +12,23 @@
 #define USHIELD_IOC_MAGIC 's'
 #define USHIELD_VERSION 0x00010000; // v0.1.0
 
+#define USHIELD_PATH_MAX 256
+
+/* Target Registration Payload */
+struct ushield_target_config {
+    char binary_path[USHIELD_PATH_MAX]; // Absolute file path to target binary
+    uint32_t permissions;               // Bitmask to allowed USHIELD_PERM_*
+    uint32_t flags;                     // Execution flags
+};
+
 /* IOCTL Command Definitions */
 #define USHIELD_IOC_PING _IO(USHIELD_IOC_MAGIC, 1)
 #define USHIELD_IOC_GET_VERSION _IOR(USHIELD_IOC_MAGIC, 2, uint32_t)
 #define USHIELD_IOC_REGISTER_SUPERVISOR _IO(USHIELD_IOC_MAGIC, 3)
 #define USHIELD_IOC_SEAL_SELF _IOW(USHIELD_IOC_MAGIC, 4, uint32_t)
-#define USHIELD_IOC_SEAL_TARGET _IOW(USHIELD_IOC_MAGIC, 5, struct ushield_seal_config)
-#define USHIELD_IOC_GET_POLICY _IOWR(USHIELD_IOC_MAGIC, 6, struct ushield_seal_config)
+#define USHIELD_IOC_REGISTER_TARGET _IOW(USHIELD_IOC_MAGIC, 5, struct ushield_target_config)
+#define USHIELD_IOC_GET_POLICY _IOWR(USHIELD_IOC_MAGIC, 6, struct ushield_target_config)
+#define USHIELD_IOC_UNREGISTER_TARGET _IOWR(USHIELD_IOC_MAGIC, 7, struct ushield_target_config)
 
 /* Permission Categories */
 #define USHIELD_PERM_NONE 0x00000000U
@@ -28,13 +38,6 @@
 #define USHIELD_PERM_NET (1U << 3)     /* Network socket operations */
 #define USHIELD_PERM_PROCESS (1U << 4) /* Process lifecycle (fork/clone) */
 #define USHIELD_PERM_ALL 0xFFFFFFFFU
-
-/* Target Seal Configuration Payload */
-struct ushield_seal_config {
-    uint32_t target_pid;  /* PID to seal */
-    uint32_t permissions; /* Allowed USHIELD_PERM_* mask */
-    uint32_t flags;       /* Mode flags */
-};
 
 /* Telemetry Ring Buffer Definitions */
 #define USHIELD_RING_CAPACITY 1024

@@ -1,6 +1,7 @@
 #include "../../include/ushield_uapi.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -35,29 +36,24 @@ static inline void LOG_PERROR(const char *msg) {
 }
 
 /*
- * Unprivileged, Self-Sealed HTTP Worker Process (ushieldd-http)
+ * Unprivileged HTTP Worker Process (ushieldd-http)
  */
 static void run_http_worker(int ipc_fd) {
     LOG_INFO("[ushieldd-http] Worker started (PID %d)\n", getpid());
 
-    // 1. Worker opens /dev/ushield once to self-seal, then closes file descriptor
+    // Worker self-seals
     int dev_fd = open("/dev/ushield", O_RDWR);
     if (dev_fd >= 0) {
         uint32_t worker_perms = USHIELD_PERM_READ | USHIELD_PERM_WRITE | USHIELD_PERM_NET;
         if (ioctl(dev_fd, USHIELD_IOC_SEAL_SELF, &worker_perms) == 0) {
-            LOG_INFO("[ushieldd-http] Worker successfully SELF-SEALED in Ring 0 (Perms: 0x%08X)\n",
-                     worker_perms);
-        } else {
-            LOG_PERROR("[ushieldd-http] Worker self-seal failed");
+            LOG_INFO("[ushieldd-http] Worker successfully SELF-SEALED in Ring 0\n");
         }
         close(dev_fd);
-    } else {
-        LOG_PERROR("[ushieldd-http] Could not open device for self-sealing");
     }
 
-    // 2. Communicate with Master Supervisor strictly over anonymous IPC socketpair
-    const char *msg = "REQ_SUPERVISOR_PING";
-    LOG_INFO("[ushieldd-http] Sending IPC message to Master Supervisor...\n");
+    // Send RPC message over socketpair
+    const char *msg = "REQ_REGISTER_TARGET";
+    LOG_INFO("[ushieldd-http] Sending Target Execution Request to Master Supervisor...\n");
     if (write(ipc_fd, msg, strlen(msg)) < 0) {
         LOG_PERROR("[ushieldd-http] IPC write failed");
     }
@@ -69,14 +65,48 @@ static void run_http_worker(int ipc_fd) {
     }
 
     close(ipc_fd);
-    LOG_INFO("[ushieldd-http] Worker process exiting cleanly.\n");
+    LOG_INFO("[ushieldd-http] Worker exiting cleanly.\n");
     exit(EXIT_SUCCESS);
+}
+
+/*
+ * Helper to register target execution rule in Ring 0
+ */
+static int register_target_binary(int dev_fd, const char *abs_path, uint32_t perms) {
+    struct ushield_target_config cfg = {0};
+    snprintf(cfg.binary_path, sizeof(cfg.binary_path), "%s", abs_path);
+    cfg.permissions = perms;
+
+    LOG_INFO("[ushieldd-core] Registering target rule for '%s' (Perms: 0x%08X)...\n", abs_path,
+             perms);
+
+    if (ioctl(dev_fd, USHIELD_IOC_REGISTER_TARGET, &cfg) < 0) {
+        LOG_PERROR("[ushieldd-core] Target registration failed");
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Helper to unregister target execution rule in Ring 0
+ */
+static int unregister_target_binary(int dev_fd, const char *abs_path) {
+    struct ushield_target_config cfg = {0};
+    snprintf(cfg.binary_path, sizeof(cfg.binary_path), "%s", abs_path);
+
+    LOG_INFO("[ushieldd-core] Unregistered target rule for '%s'...\n", abs_path);
+
+    if (ioctl(dev_fd, USHIELD_IOC_UNREGISTER_TARGET, &cfg) < 0) {
+        LOG_PERROR("[ushieldd-core] Target unregistration failed");
+        return -1;
+    }
+
+    return 0;
 }
 
 int main(void) {
     LOG_INFO("Initializing µShield Control Daemon Engine (PID %d)...\n", getpid());
 
-    // Create anonymous local IPC channel before fork
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
         LOG_PERROR("Failed to create PrivSep socketpair");
@@ -90,30 +120,25 @@ int main(void) {
     }
 
     if (child_pid == 0) {
-        /* Child Context: ushieldd-http Worker */
-        close(sv[0]); // Close Master end of IPC
+        close(sv[0]);
         run_http_worker(sv[1]);
     }
 
-    /* Parent Context: ushieldd-core Master Supervisor */
-    close(sv[1]); // Close Worker end of IPC
+    close(sv[1]);
     int master_ipc = sv[0];
 
-    LOG_INFO("[ushieldd-core] Master Supervisor initializing (PID %d)...\n", getpid());
+    LOG_INFO("[ushieldd-core] Master Supervirsor initializing (PID %d)...\n", getpid());
 
     int dev_fd = open("/dev/ushield", O_RDWR);
     if (dev_fd < 0) {
         LOG_PERROR("[ushieldd-core] Failed to open /dev/ushield");
-        close(master_ipc);
-        return EXIT_FAILURE;
+        goto ffailure;
     }
 
-    // 1. Register as Master Supervisor in Ring 0
+    // 1. Register Supervisor in Ring 0
     if (ioctl(dev_fd, USHIELD_IOC_REGISTER_SUPERVISOR) < 0) {
-        LOG_PERROR("[ushieldd-core] Failed to register as Master Supervisor");
-        close(dev_fd);
-        close(master_ipc);
-        return EXIT_FAILURE;
+        LOG_PERROR("[ushieldd-core] Supervisor registration failed");
+        goto failure;
     }
 
     // 2. Map Telemetry Ring Buffer
@@ -122,28 +147,39 @@ int main(void) {
         mmap(NULL, ring_size, PROT_READ | PROT_WRITE, MAP_SHARED, dev_fd, 0);
     if (ring == MAP_FAILED) {
         LOG_PERROR("[ushieldd-core] Failed to mmap ring buffer");
-        close(dev_fd);
-        close(master_ipc);
-        return EXIT_FAILURE;
+        goto failure;
     }
 
-    // 3. Handle IPC RPC request from unprivileged Web Worker
+    // 3. Resolve absolute path of test target binary
+    char abs_target_path[USHIELD_PATH_MAX];
+    if (realpath("dist/test_target", abs_target_path) == NULL) {
+        LOG_PERROR("[ushieldd-core] Could not resolve dist/test_target path");
+        goto failure;
+    }
+
+    // 4. Handle Worker IPC Request
     char buf[64] = {0};
     ssize_t bytes = read(master_ipc, buf, sizeof(buf) - 1);
     if (bytes > 0) {
         LOG_INFO("[ushieldd-core] Master received IPC request: '%s'\n", buf);
-        const char *ack = "ACK_SUPERVISOR_OK";
+
+        // Register execution rule for test target
+        register_target_binary(dev_fd, abs_target_path, USHIELD_PERM_READ | USHIELD_PERM_EXEC);
+
+        const char *ack = "ACK_TARGET_REGISTERED";
         if (write(master_ipc, ack, strlen(ack)) < 0) {
             LOG_PERROR("[ushieldd-core] IPC ack write failed");
         }
     }
 
-    // 4. Wait for Worker to terminate
     int status;
     waitpid(child_pid, &status, 0);
 
-    // 5. Drain pending telemetry events emitted during sealing & open calls
-    LOG_INFO("[ushieldd-core] Draining ring buffer events...\n");
+    // 5. Unregister rule to verify dynamic cleanup in Ring 0
+    unregister_target_binary(dev_fd, abs_target_path);
+
+    // 6. Drain Telemetry Events
+    LOG_INFO("[ushieldd-core] Draining telemetry events...\n");
     while (ring->tail < ring->head) {
         uint32_t idx = ring->tail & (USHIELD_RING_CAPACITY - 1);
         struct ushield_event *ev = &ring->events[idx];
@@ -158,6 +194,12 @@ int main(void) {
     munmap(ring, ring_size);
     close(dev_fd);
     close(master_ipc);
-    LOG_INFO("[ushieldd-core] PrivSep Master test completed cleanly.\n");
+    LOG_INFO("[ushieldd-core] Target registration engine test completed cleanly.\n");
     return EXIT_SUCCESS;
+
+failure:
+    close(dev_fd);
+ffailure:
+    close(master_ipc);
+    return EXIT_FAILURE;
 }

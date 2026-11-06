@@ -1,9 +1,9 @@
 PREFIX ?= /usr/local
 DIST_DIR ?= dist
 
-.PHONY: all daemon kernel clean install install-dist
+.PHONY: all daemon kernel clean install install-dist tests
 
-all: daemon kernel
+all: daemon kernel tests
 
 daemon:
 	@echo "=== Building Userspace Daemon (ushieldd) ==="
@@ -12,6 +12,11 @@ daemon:
 kernel:
 	@echo "=== Building Kernel Module (ushield.ko) ==="
 	$(MAKE) -C kernel
+
+tests:
+	@echo "=== Building Test Targets ==="
+	mkdir -p dist
+	$(CC) $(CFLAGS) tests/test_target.c -o dist/test_target
 
 clean:
 	$(MAKE) -C daemon clean

@@ -411,5 +411,16 @@
     ],
     "directory": "/home/tralsesec/Programming/C/ushield/kernel",
     "output": ".module-common.o"
+  },
+  {
+    "file": "tests/test_target.c",
+    "arguments": [
+      "/usr/bin/cc",
+      "tests/test_target.c",
+      "-o",
+      "dist/test_target"
+    ],
+    "directory": "/home/tralsesec/Programming/C/ushield",
+    "output": "dist/test_target"
   }
 ]
