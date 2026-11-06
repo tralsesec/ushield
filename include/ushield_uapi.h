@@ -26,6 +26,12 @@ typedef enum ushield_event_type {
     USHIELD_EVENT_PROCESS_SEAL = 3,
 } ushield_event_type_t;
 
+/* Action Types */
+typedef enum ushield_action_type {
+    USHIELD_ACTION_ALLOW = 0,
+    USHIELD_ACTION_DENY = 1
+} ushield_action_type_t;
+
 /* Single Telemetry Record (Fixed Size: 64 bytes for cache-line alignment) */
 struct ushield_event {
     uint64_t timestamp_ns; /* Kernel monotonic timestamp (ktime_get_ns) */

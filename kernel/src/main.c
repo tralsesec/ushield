@@ -1,16 +1,17 @@
 #define pr_fmt(fmt) "[µShield] " fmt
 
-#include "linux/types.h"
-#include <asm/io.h>
 #include <linux/cdev.h>
 #include <linux/cred.h>
 #include <linux/device.h>
 #include <linux/fs.h>
 #include <linux/init.h>
+#include <linux/io.h>
 #include <linux/kernel.h>
+#include <linux/ktime.h>
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/slab.h>
+#include <linux/types.h>
 #include <linux/uaccess.h>
 
 #include "../../include/ushield_uapi.h"
@@ -28,6 +29,30 @@ static struct cdev ushield_cdev;
 static struct class *ushield_class;
 static struct device *ushield_device;
 static struct ushield_ring_buffer *ring_buf = NULL;
+
+/*
+ * Pushes a telemetry event into the lockless ring buffer (Producer)
+ */
+static void ushield_produce_event(ushield_event_type_t type, uint32_t syscall_nr,
+                                  ushield_action_type_t action) {
+    if (!ring_buf)
+        return;
+
+    // Lockless circular index calculation using bitwise MASK (capacity - 1)
+    uint32_t idx = ring_buf->head & (USHIELD_RING_CAPACITY - 1);
+    struct ushield_event *ev = &ring_buf->events[idx];
+
+    ev->timestamp_ns = ktime_get_ns();
+    ev->pid = current->pid;
+    ev->uid = current->cred->uid.val;
+    ev->event_type = type;
+    ev->syscall_nr = syscall_nr;
+    ev->action_taken = action;
+
+    // Ensure memory writes complete before incrementing head (Memory Barrier)
+    smp_mb();
+    ring_buf->head++;
+}
 
 /*
  * VFS .mmap Callback: Maps Ring 0 kernel ring buffer directly to Ring 3 virtual memory.
@@ -61,10 +86,11 @@ static int ushield_mmap(struct file *file, struct vm_area_struct *vma) {
  */
 static int ushield_open(struct inode *inode, struct file *file) {
     const struct cred *cred = current_cred();
-
     pr_info("/dev/ushild opened by PID %d (UID: %d, EUID: %d)\n", current->pid, cred->uid.val,
             cred->euid.val);
 
+    // Push telemetry event on open
+    ushield_produce_event(USHIELD_EVENT_SYSCALL_EXEC, 2, USHIELD_ACTION_ALLOW);
     return 0;
 }
 

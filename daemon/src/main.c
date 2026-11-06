@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #define LOG_PREFIX "[µShield] "
@@ -56,8 +57,7 @@ int main(void) {
     LOG_INFO("Sending USHIELD_IOC_PING...\n");
     if (ioctl(fd, USHIELD_IOC_PING) < 0) {
         LOG_PERROR("PING ioctl failed");
-        close(fd);
-        return EXIT_FAILURE;
+        goto failed;
     }
 
     // 2. Fetch Driver Version via ioctl
@@ -65,8 +65,7 @@ int main(void) {
     LOG_INFO("Fetching driver version via USHIELD_IOC_GET_VERSION...\n");
     if (ioctl(fd, USHIELD_IOC_GET_VERSION, &version) < 0) {
         LOG_PERROR("GET_VERSION ioctl failed");
-        close(fd);
-        return EXIT_FAILURE;
+        goto failed;
     }
 
     uint8_t major = (version >> 16) & 0xFF;
@@ -75,7 +74,37 @@ int main(void) {
 
     LOG_INFO("Received Driver Version: v%d.%d.%d (0x%08X)\n", major, minor, patch, version);
 
+    size_t ring_size = sizeof(struct ushield_ring_buffer);
+    struct ushield_ring_buffer *ring =
+        mmap(NULL, ring_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+
+    if (ring == MAP_FAILED) {
+        LOG_PERROR("Failed to mmap ring buffer");
+        goto failed;
+    }
+
+    LOG_INFO("Successfully mapped Ring Buffer at %p (Capacity: %u events)\n", (void *)ring,
+             ring->capacity);
+
+    // Poll events off the ring buffer (Consumer)
+    while (ring->tail < ring->head) {
+        uint32_t idx = ring->tail & (USHIELD_RING_CAPACITY - 1);
+        struct ushield_event *ev = &ring->events[idx];
+
+        LOG_INFO("[EVENT] TS: %lu ns | PID: %u | Syscall: %u | Action: %u\n", ev->timestamp_ns,
+                 ev->pid, ev->syscall_nr, ev->action_taken);
+
+        ring->tail++;
+    }
+
+    // Clean up mapping before exit
+    munmap(ring, ring_size);
+
     close(fd);
     LOG_INFO("Test completed cleanly.\n");
     return EXIT_SUCCESS;
+
+failed:
+    close(fd);
+    return EXIT_FAILURE;
 }
