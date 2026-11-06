@@ -76,7 +76,7 @@ The REST API (and matching Web UI) exposes full operational control over the eng
 - [x] **Phase 0:** Project layout, Makefile build system, and isolated QEMU/KVM dev VM setup.
 - [x] **Phase 1:** Core LKM skeleton (`ushield.ko`) & character device registration (`/dev/ushield`).
 - [ ] **Phase 2:** Bare-metal C daemon (`ushieldd`), `ushield.conf` parser, and embedded Web UI.
-- [ ] **Phase 3:** Zero-copy `mmap` ring buffer telemetry transport.
+- [x] **Phase 3:** Zero-copy `mmap` ring buffer telemetry transport.
 - [ ] **Phase 4:** Asymmetric namespace isolation engine & `sys_shield_seal` implementation.
 - [ ] **Phase 5:** eBPF LSM syscall filtering (Category rules & explicit whitelists/blacklists).
 - [ ] **Phase 6 (Future):** *Behavioral Sequence Filtering* — Advanced workflow state machines in Ring 0 to evaluate execution sequences (e.g., allow `sys_A`, but terminate if followed immediately by `sys_B`).
