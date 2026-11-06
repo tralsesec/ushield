@@ -1,4 +1,3 @@
-```markdown
 # µShield (ushield)
 
 > *Status: Work In Progress (WIP) — Active Pre-v0.1 Development*
