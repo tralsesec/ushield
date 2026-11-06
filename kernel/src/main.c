@@ -1,13 +1,16 @@
 #define pr_fmt(fmt) "[µShield] " fmt
 
 #include "linux/types.h"
+#include <asm/io.h>
 #include <linux/cdev.h>
 #include <linux/cred.h>
 #include <linux/device.h>
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
+#include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/slab.h>
 #include <linux/uaccess.h>
 
 #include "../../include/ushield_uapi.h"
@@ -24,6 +27,33 @@ static dev_t dev_num;
 static struct cdev ushield_cdev;
 static struct class *ushield_class;
 static struct device *ushield_device;
+static struct ushield_ring_buffer *ring_buf = NULL;
+
+/*
+ * VFS .mmap Callback: Maps Ring 0 kernel ring buffer directly to Ring 3 virtual memory.
+ */
+static int ushield_mmap(struct file *file, struct vm_area_struct *vma) {
+    unsigned long size = vma->vm_end - vma->vm_start;
+    unsigned long expected_size = PAGE_ALIGN(sizeof(struct ushield_ring_buffer));
+
+    if (size > expected_size) {
+        pr_err("mmap size request (%lu bytes) exceeds allocated ring buffer (%lu bytes)\n", size,
+               expected_size);
+        return -EINVAL;
+    }
+
+    // Convert kernel virtual address to Physical Page Frame Number (PFN)
+    unsigned long pfn = virt_to_phys((void *)ring_buf) >> PAGE_SHIFT;
+
+    // Map physical address to user-space virtual memory space
+    if (remap_pfn_range(vma, vma->vm_start, pfn, size, vma->vm_page_prot)) {
+        pr_err("remap_pfn_range failed!\n");
+        return -EAGAIN;
+    }
+
+    pr_info("mmap successfully mapped %lu bytes to PID %d\n", size, current->pid);
+    return 0;
+}
 
 /*
  * Called when a process opens /dev/ushild.
@@ -78,6 +108,7 @@ static struct file_operations fops = {
     .open = ushield_open,
     .release = ushield_release,
     .unlocked_ioctl = ushield_ioctl,
+    .mmap = ushield_mmap,
 };
 
 /*
@@ -96,14 +127,23 @@ static int __init ushield_init(void) {
 
     pr_info("Initializing Ring 0 driver...\n");
 
-    // 1. Request dynamic Major/Minor region from VFS
+    // Step 1: Allocate ring buffer memory
+    ring_buf = kmalloc(sizeof(struct ushield_ring_buffer), GFP_KERNEL);
+    if (!ring_buf) {
+        pr_err("Failed to allocate ring buffer memory\n");
+        return -ENOMEM;
+    }
+    memset(ring_buf, 0, sizeof(struct ushield_ring_buffer));
+    ring_buf->capacity = USHIELD_RING_CAPACITY;
+
+    // Step 2: Allocate device numbers
     ret = alloc_chrdev_region(&dev_num, 0, 1, DEVICE_NAME);
     if (ret < 0) {
         pr_err("Failed to allocate major/minor region (err: %d)\n", ret);
-        return ret;
+        goto fail_free_ring;
     }
 
-    // 2. Initialize character device & link VFS callbacks
+    // Step 3: Register cdev
     cdev_init(&ushield_cdev, &fops);
     ushield_cdev.owner = THIS_MODULE;
 
@@ -113,7 +153,7 @@ static int __init ushield_init(void) {
         goto fail_unregister;
     }
 
-    // 3. Register class in sysfs (/sys/class/ushield_class)
+    // Step 4: Create class
     ushield_class = class_create(CLASS_NAME);
     if (IS_ERR(ushield_class)) {
         ret = PTR_ERR(ushield_class);
@@ -123,7 +163,7 @@ static int __init ushield_init(void) {
 
     ushield_class->devnode = ushield_devnode;
 
-    // 4. Register device node (/dev/ushield)
+    // Step 5: Create device node
     ushield_device = device_create(ushield_class, NULL, dev_num, NULL, DEVICE_NAME);
     if (IS_ERR(ushield_device)) {
         ret = PTR_ERR(ushield_device);
@@ -136,12 +176,15 @@ static int __init ushield_init(void) {
 
     return 0;
 
+/* Error Unwind Chain (Reverse Order) */
 fail_class:
     class_destroy(ushield_class);
 fail_cdev:
     cdev_del(&ushield_cdev);
 fail_unregister:
     unregister_chrdev_region(dev_num, 1);
+fail_free_ring:
+    kfree(ring_buf);
     return ret;
 }
 
@@ -150,6 +193,11 @@ static void __exit ushield_exit(void) {
     class_destroy(ushield_class);
     cdev_del(&ushield_cdev);
     unregister_chrdev_region(dev_num, 1);
+
+    // Free ring buffer
+    if (ring_buf) {
+        kfree(ring_buf);
+    }
 
     pr_info("Driver unloaded cleanly from Ring 0\n");
 }
