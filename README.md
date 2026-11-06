@@ -14,9 +14,9 @@
 │                                                                         │
 │  ┌─────────────────────────────┐         ┌───────────────────────────┐  │
 │  │ ushieldd-http (Web UI)      │         │ ushieldd-core (Master)    │  │
-│  │ • Unprivileged (UID 1000)   │  socket │ • Master Supervisor (UID 0│  │
+│  │ • Unprivileged (UID 1000)   │  socket │ • Master Supervisor (UID 0)  │
 │  │ • Self-Sealed (No /dev access)◄pair──►│ • Handles /dev/ushield    │  │
-│  │ • Exposes HTTP / Web UI     │   IPC   │ • Issues Kernel ioctls    │  │
+│  │ • Exposes HTTP / API        │   IPC   │ • Issues Kernel ioctls    │  │
 │  └─────────────────────────────┘         └─────────────┬─────────────┘  │
 └────────────────────────────────────────────────────────┼────────────────┘
                                                          │ /dev/ushield
@@ -38,13 +38,11 @@
 
 ### 1. Privilege-Separated User-Space Controller (`ushieldd`)
 
-* **Zero External Dependencies:** Statically linked C11 binary using `static inline` variadic loggers and strict format enforcement (`-std=c11 -Wall -Wextra -pedantic`).
+* **Zero External Dependencies:** Statically linked C11 binary.
 * **Privilege Separation (PrivSep):** The daemon splits into two isolated execution contexts upon launch:
-1. **`ushieldd-core` (Master Supervisor):** Runs as `root` (UID 0), registers with `ushield.ko`, retains exclusive administrative access to `/dev/ushield`, and acts as an internal RPC router.
-2. **`ushieldd-http` (Web UI Worker):** Spawns via `fork()`, drops privileges to an unprivileged user (`nobody`/`uid 1000`), closes `/dev/ushield` descriptors, and self-seals via `USHIELD_IOC_SEAL_SELF`.
-
-
-* **Isolated Control IPC:** `ushieldd-http` communicates with `ushieldd-core` strictly across an anonymous `AF_UNIX` `socketpair` IPC bridge. An RCE in the Web UI stack cannot issue `ioctl` commands or tamper with Ring 0.
+    1. **`ushieldd-core` (Master Supervisor):** Runs as `root` (UID 0), registers with `ushield.ko`, retains exclusive administrative access to `/dev/ushield`, and acts as an internal RPC router.
+    2. **`ushieldd-http` (API/Web UI Worker):** Spawns via `fork()`, drops privileges to an unprivileged user (`nobody`/`uid 1000`), closes `/dev/ushield` descriptors, and self-seals via `USHIELD_IOC_SEAL_SELF`.
+* **Isolated Control IPC:** `ushieldd-http` communicates with `ushieldd-core` strictly across an anonymous `AF_UNIX` `socketpair` IPC bridge. An RCE in the Web stack cannot issue `ioctl` commands or tamper with Ring 0.
 * **Embedded Control Plane:** Embedded Single-Page Web UI served directly from C bytecode. Simple file-based configuration via `ushield.conf`.
 
 ### 2. Micro-Container & Asymmetric Namespace Isolation
@@ -55,7 +53,7 @@
 
 ### 3. Ring 0 Kernel Driver & Telemetry (`ushield.ko`)
 
-* **Zero-Copy IPC Telemetry:** Direct `/dev/ushield` character device offering contiguous `mmap` ring buffers for lockless, nanosecond telemetry streaming directly into user space (`smp_wmb()` barrier protected).
+* **Zero-Copy IPC Telemetry:** Direct `/dev/ushield` character device offering contiguous `mmap` ring buffers for lockless, nanosecond telemetry streaming directly into user space.
 * **Master Supervisor Security:** `USHIELD_IOC_REGISTER_SUPERVISOR` locks administrative capabilities to the verified master daemon PID.
 * **Granular Category Sealing:** Replaces blanket locks with bitmask permission profiles:
     1. `USHIELD_PERM_READ`: File read operations.
