@@ -10,7 +10,10 @@
 #include <linux/ktime.h>
 #include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/pid.h>
+#include <linux/rcupdate.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
 
@@ -23,88 +26,84 @@ MODULE_VERSION("0.1");
 
 #define DEVICE_NAME "ushield"
 #define CLASS_NAME "ushield_class"
+#define MAX_SEALED_PROCESSES 256
+
+struct ushield_policy {
+    pid_t pid;
+    pid_t creator_pid;
+    uint32_t permissions;
+    bool active;
+};
+
+struct ushield_registry {
+    struct ushield_policy policies[MAX_SEALED_PROCESSES];
+    size_t count;
+    pid_t master_daemon_pid;
+    spinlock_t lock;
+};
 
 static dev_t dev_num;
 static struct cdev ushield_cdev;
 static struct class *ushield_class;
 static struct device *ushield_device;
 static struct ushield_ring_buffer *ring_buf = NULL;
+static struct ushield_registry registry;
 
-/*
- * Pushes a telemetry event into the lockless ring buffer (Producer)
- */
-static void ushield_produce_event(ushield_event_type_t type, uint32_t syscall_nr,
-                                  ushield_action_type_t action) {
-    if (!ring_buf)
+static void ushield_produce_event(uint32_t type, uint32_t syscall_nr, uint8_t action) {
+    if (!ring_buf) {
         return;
+    }
 
-    // Lockless circular index calculation using bitwise MASK (capacity - 1)
     uint32_t idx = ring_buf->head & (USHIELD_RING_CAPACITY - 1);
     struct ushield_event *ev = &ring_buf->events[idx];
 
     ev->timestamp_ns = ktime_get_ns();
     ev->pid = current->pid;
-    ev->uid = current->cred->uid.val;
+    ev->uid = current_cred()->uid.val;
     ev->event_type = type;
     ev->syscall_nr = syscall_nr;
     ev->action_taken = action;
 
-    // Ensure memory writes complete before incrementing head (Memory Barrier)
-    smp_mb();
+    smp_wmb();
     ring_buf->head++;
 }
 
-/*
- * VFS .mmap Callback: Maps Ring 0 kernel ring buffer directly to Ring 3 virtual memory.
- */
-static int ushield_mmap(struct file *file, struct vm_area_struct *vma) {
-    unsigned long size = vma->vm_end - vma->vm_start;
-    unsigned long expected_size = PAGE_ALIGN(sizeof(struct ushield_ring_buffer));
-
-    if (size > expected_size) {
-        pr_err("mmap size request (%lu bytes) exceeds allocated ring buffer (%lu bytes)\n", size,
-               expected_size);
-        return -EINVAL;
-    }
-
-    // Convert kernel virtual address to Physical Page Frame Number (PFN)
-    unsigned long pfn = virt_to_phys((void *)ring_buf) >> PAGE_SHIFT;
-
-    // Map physical address to user-space virtual memory space
-    if (remap_pfn_range(vma, vma->vm_start, pfn, size, vma->vm_page_prot)) {
-        pr_err("remap_pfn_range failed!\n");
-        return -EAGAIN;
-    }
-
-    pr_info("mmap successfully mapped %lu bytes to PID %d\n", size, current->pid);
-    return 0;
-}
-
-/*
- * Called when a process opens /dev/ushild.
- * Logs the caller's PID and UID/EUID for Ring 0 auditing.
- */
 static int ushield_open(struct inode *inode, struct file *file) {
     const struct cred *cred = current_cred();
-    pr_info("/dev/ushild opened by PID %d (UID: %d, EUID: %d)\n", current->pid, cred->uid.val,
+    pr_info("/dev/ushield opened by PID %d (UID: %d, EUID: %d)\n", current->pid, cred->uid.val,
             cred->euid.val);
 
-    // Push telemetry event on open
-    ushield_produce_event(USHIELD_EVENT_SYSCALL_EXEC, 2, USHIELD_ACTION_ALLOW);
+    ushield_produce_event(USHIELD_EVENT_SYSCALL_EXEC, 2 /* __NR_open */, 0 /* ALLOW */);
     return 0;
 }
 
-/*
- * Called when a process closes its file descriptor to /dev/ushield.
- */
 static int ushield_release(struct inode *inode, struct file *file) {
-    pr_info("/dev/ushield closed by PID %d", current->pid);
+    unsigned long flags;
+    spin_lock_irqsave(&registry.lock, flags);
+    if (registry.master_daemon_pid == current->pid) {
+        registry.master_daemon_pid = 0;
+        pr_info("Master Supervisor PID %d unregistered on close\n", current->pid);
+    }
+    spin_unlock_irqrestore(&registry.lock, flags);
+
+    pr_info("/dev/ushield closed by PID %d\n", current->pid);
     return 0;
 }
 
-/*
- * ioctl Handler: Receives control commands from ushieldd
- */
+static bool is_pid_alive(pid_t pid) {
+    bool alive = false;
+    if (pid <= 0)
+        return false;
+
+    rcu_read_lock();
+    if (pid_task(find_vpid(pid), PIDTYPE_PID) != NULL) {
+        alive = true;
+    }
+    rcu_read_unlock();
+
+    return alive;
+}
+
 static long ushield_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
     switch (cmd) {
     case USHIELD_IOC_PING:
@@ -120,15 +119,167 @@ static long ushield_ioctl(struct file *file, unsigned int cmd, unsigned long arg
         return 0;
     }
 
+    case USHIELD_IOC_REGISTER_SUPERVISOR: {
+        pid_t pid = current->pid;
+
+        // 1. Root Credential Check
+        if (current_cred()->uid.val != 0) {
+            pr_warn("PID %d failed supervisor registration (Requires UID 0)\n", pid);
+            return -EPERM;
+        }
+
+        unsigned long flags;
+        spin_lock_irqsave(&registry.lock, flags);
+
+        // 2. Existing Supervisor Active Check
+        if (registry.master_daemon_pid) {
+            bool active = is_pid_alive(registry.master_daemon_pid);
+            if (active && registry.master_daemon_pid != pid) {
+                pr_warn("Supervisor registration denied for PID %d: Master Supervisor already "
+                        "active (PID %d)\n",
+                        pid, registry.master_daemon_pid);
+                spin_unlock_irqrestore(&registry.lock, flags);
+                return -EBUSY; // Resource Busy
+            }
+
+            if (!active) {
+                pr_info("Stale Master Supervisor detected (Dead PID %d). Replacing with PID %d\n",
+                        registry.master_daemon_pid, pid);
+            }
+        }
+
+        // 3. Register New Supervisor PID
+        registry.master_daemon_pid = pid;
+        spin_unlock_irqrestore(&registry.lock, flags);
+
+        pr_info("Master Supervisor successfully registered (PID %d)\n", pid);
+        return 0;
+    }
+
+    case USHIELD_IOC_SEAL_SELF: {
+        uint32_t perms = 0;
+        if (copy_from_user(&perms, (uint32_t __user *)arg, sizeof(perms))) {
+            return -EFAULT;
+        }
+
+        unsigned long flags;
+        int status = 0;
+
+        spin_lock_irqsave(&registry.lock, flags);
+        if (registry.count < MAX_SEALED_PROCESSES) {
+            registry.policies[registry.count].pid = current->pid;
+            registry.policies[registry.count].creator_pid = current->pid;
+            registry.policies[registry.count].permissions = perms;
+            registry.policies[registry.count].active = true;
+            registry.count++;
+            pr_info("Process PID %d SELF-SEALED (Perms: 0x%08X)\n", current->pid, perms);
+        } else {
+            status = -ENOMEM;
+        }
+        spin_unlock_irqrestore(&registry.lock, flags);
+
+        if (status == 0) {
+            ushield_produce_event(USHIELD_EVENT_PROCESS_SEAL, 0, 0);
+        }
+        return status;
+    }
+
+    case USHIELD_IOC_SEAL_TARGET: {
+        struct ushield_seal_config config;
+        if (copy_from_user(&config, (struct ushield_seal_config __user *)arg, sizeof(config))) {
+            return -EFAULT;
+        }
+
+        unsigned long flags;
+        int status = 0;
+
+        spin_lock_irqsave(&registry.lock, flags);
+        /* Only Master Daemon or Parent Creator can seal arbitrary target */
+        if (current->pid != registry.master_daemon_pid &&
+            current->pid != (pid_t)config.target_pid) {
+            spin_unlock_irqrestore(&registry.lock, flags);
+            return -EPERM;
+        }
+
+        if (registry.count < MAX_SEALED_PROCESSES) {
+            registry.policies[registry.count].pid = (pid_t)config.target_pid;
+            registry.policies[registry.count].creator_pid = current->pid;
+            registry.policies[registry.count].permissions = config.permissions;
+            registry.policies[registry.count].active = true;
+            registry.count++;
+            pr_info("Target PID %d SEALED by PID %d (Perms: 0x%08X)\n", config.target_pid,
+                    current->pid, config.permissions);
+        } else {
+            status = -ENOMEM;
+        }
+        spin_unlock_irqrestore(&registry.lock, flags);
+
+        if (status == 0) {
+            ushield_produce_event(USHIELD_EVENT_PROCESS_SEAL, 0, 0);
+        }
+        return status;
+    }
+
+    case USHIELD_IOC_GET_POLICY: {
+        struct ushield_seal_config config;
+        if (copy_from_user(&config, (struct ushield_seal_config __user *)arg, sizeof(config))) {
+            return -EFAULT;
+        }
+
+        unsigned long flags;
+        bool found = false;
+
+        spin_lock_irqsave(&registry.lock, flags);
+        for (size_t i = 0; i < registry.count; i++) {
+            if (registry.policies[i].active &&
+                registry.policies[i].pid == (pid_t)config.target_pid) {
+                /* Scoped Identity Check: Creator or Master */
+                if (current->pid == registry.policies[i].creator_pid ||
+                    current->pid == registry.master_daemon_pid) {
+                    config.permissions = registry.policies[i].permissions;
+                    found = true;
+                }
+                break;
+            }
+        }
+        spin_unlock_irqrestore(&registry.lock, flags);
+
+        if (found) {
+            if (copy_to_user((struct ushield_seal_config __user *)arg, &config, sizeof(config))) {
+                return -EFAULT;
+            }
+            return 0;
+        }
+        return -EPERM;
+    }
+
     default:
-        pr_warn("Uknown ioctl command 0x%x from PID %d\n", cmd, current->pid);
-        return -ENOTTY; // Standard POSIX error for unknown ioctl.
+        pr_warn("Unknown ioctl command 0x%x from PID %d\n", cmd, current->pid);
+        return -ENOTTY;
     }
 }
 
-/*
- * Virtual File System (VFS) callback dispatch table.
- */
+static int ushield_mmap(struct file *file, struct vm_area_struct *vma) {
+    unsigned long size = vma->vm_end - vma->vm_start;
+    unsigned long expected_size = PAGE_ALIGN(sizeof(struct ushield_ring_buffer));
+
+    if (size > expected_size) {
+        pr_err("mmap size request (%lu bytes) exceeds allocated ring buffer (%lu bytes)\n", size,
+               expected_size);
+        return -EINVAL;
+    }
+
+    unsigned long pfn = virt_to_phys((void *)ring_buf) >> PAGE_SHIFT;
+
+    if (remap_pfn_range(vma, vma->vm_start, pfn, size, vma->vm_page_prot)) {
+        pr_err("remap_pfn_range failed!\n");
+        return -EAGAIN;
+    }
+
+    pr_info("mmap successfully mapped %lu bytes to PID %d\n", size, current->pid);
+    return 0;
+}
+
 static struct file_operations fops = {
     .owner = THIS_MODULE,
     .open = ushield_open,
@@ -137,10 +288,6 @@ static struct file_operations fops = {
     .mmap = ushield_mmap,
 };
 
-/*
- * Custom udev callback setting /dev/ushield mode to 0666 (rw-rw-rw-),
- * enabling unprivileged user space daemons (ushieldd) to access the node.
- */
 static char *ushield_devnode(const struct device *dev, umode_t *mode) {
     if (mode) {
         *mode = 0666;
@@ -153,7 +300,10 @@ static int __init ushield_init(void) {
 
     pr_info("Initializing Ring 0 driver...\n");
 
-    // Step 1: Allocate ring buffer memory
+    spin_lock_init(&registry.lock);
+    registry.count = 0;
+    registry.master_daemon_pid = 0;
+
     ring_buf = kmalloc(sizeof(struct ushield_ring_buffer), GFP_KERNEL);
     if (!ring_buf) {
         pr_err("Failed to allocate ring buffer memory\n");
@@ -162,14 +312,12 @@ static int __init ushield_init(void) {
     memset(ring_buf, 0, sizeof(struct ushield_ring_buffer));
     ring_buf->capacity = USHIELD_RING_CAPACITY;
 
-    // Step 2: Allocate device numbers
     ret = alloc_chrdev_region(&dev_num, 0, 1, DEVICE_NAME);
     if (ret < 0) {
         pr_err("Failed to allocate major/minor region (err: %d)\n", ret);
         goto fail_free_ring;
     }
 
-    // Step 3: Register cdev
     cdev_init(&ushield_cdev, &fops);
     ushield_cdev.owner = THIS_MODULE;
 
@@ -179,7 +327,6 @@ static int __init ushield_init(void) {
         goto fail_unregister;
     }
 
-    // Step 4: Create class
     ushield_class = class_create(CLASS_NAME);
     if (IS_ERR(ushield_class)) {
         ret = PTR_ERR(ushield_class);
@@ -189,7 +336,6 @@ static int __init ushield_init(void) {
 
     ushield_class->devnode = ushield_devnode;
 
-    // Step 5: Create device node
     ushield_device = device_create(ushield_class, NULL, dev_num, NULL, DEVICE_NAME);
     if (IS_ERR(ushield_device)) {
         ret = PTR_ERR(ushield_device);
@@ -202,7 +348,6 @@ static int __init ushield_init(void) {
 
     return 0;
 
-/* Error Unwind Chain (Reverse Order) */
 fail_class:
     class_destroy(ushield_class);
 fail_cdev:
@@ -220,7 +365,6 @@ static void __exit ushield_exit(void) {
     cdev_del(&ushield_cdev);
     unregister_chrdev_region(dev_num, 1);
 
-    // Free ring buffer
     if (ring_buf) {
         kfree(ring_buf);
     }
