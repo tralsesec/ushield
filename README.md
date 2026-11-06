@@ -74,7 +74,7 @@ The REST API (and matching Web UI) exposes full operational control over the eng
 ## Development Roadmap & Future Architecture
 
 - [x] **Phase 0:** Project layout, Makefile build system, and isolated QEMU/KVM dev VM setup.
-- [ ] **Phase 1:** Core LKM skeleton (`ushield.ko`) & character device registration (`/dev/ushield`).
+- [x] **Phase 1:** Core LKM skeleton (`ushield.ko`) & character device registration (`/dev/ushield`).
 - [ ] **Phase 2:** Bare-metal C daemon (`ushieldd`), `ushield.conf` parser, and embedded Web UI.
 - [ ] **Phase 3:** Zero-copy `mmap` ring buffer telemetry transport.
 - [ ] **Phase 4:** Asymmetric namespace isolation engine & `sys_shield_seal` implementation.

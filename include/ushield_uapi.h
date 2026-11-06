@@ -10,6 +10,7 @@
 
 /* Unique 8-bit magic number for µShield ioctl definition */
 #define USHIELD_IOC_MAGIC 's'
+#define USHIELD_VERSION 0x00010000; // v0.1.0
 
 /* Example control commands */
 #define USHIELD_IOC_PING _IO(USHIELD_IOC_MAGIC, 1)
