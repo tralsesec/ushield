@@ -88,7 +88,7 @@ The REST API (and matching Web UI) exposes operational control over the engine:
 * [x] **Phase 1:** Core LKM skeleton (`ushield.ko`) & character device registration (`/dev/ushield`).
 * [ ] **Phase 2:** Bare-metal C daemon (`ushieldd`), `ushield.conf` parser, and embedded Web UI.
 * [x] **Phase 3:** Zero-copy `mmap` ring buffer telemetry transport.
-* [x] **Phase 4:** PrivSep daemon split, process hierarchy identity registry, and granular process sealing (`USHIELD_IOC_SEAL_SELF`, `USHIELD_IOC_SEAL_TARGET`).
+* [x] **Phase 4:** PrivSep daemon split, process hierarchy identity registry, and granular process sealing (`USHIELD_IOC_SEAL_SELF`, `USHIELD_IOC_REGISTER_TARGET`).
 * [ ] **Phase 5:** eBPF LSM syscall filtering (Category rules & explicit whitelists/blacklists).
 * [ ] **Phase 6 (Future):** *Behavioral Sequence Filtering* — Advanced workflow state machines in Ring 0 to evaluate execution sequences (e.g., allow `sys_A`, but terminate if followed immediately by `sys_B`).
 * [ ] **Phase 7 (Future):** HTTP library replaced by [`asmhttp`](https://github.com/tralsesec/asmhttp) when ready for production.
