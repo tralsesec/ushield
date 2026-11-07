@@ -2,34 +2,48 @@
 
 > *Status: Work In Progress (WIP) — Active Pre-v0.1 Development*
 
-**µShield** is an ultra-lightweight, high-performance sandbox and security telemetry engine written in pure C (C11). Designed to bypass heavy container runtime stacks like Docker or containerd, µShield relies on direct cooperation between a privilege-separated user-space controller (`ushieldd`) and a custom Ring 0 Linux Kernel Module (`ushield.ko`) powered by eBPF LSM hooks.
+**µShield** is an ultra-lightweight, high-performance **Synthetic Kernel Emulation & Hot-Patchable Sandbox Engine** written in pure C (C11). Designed to completely bypass heavy container runtime stacks (Docker, containerd) and high-overhead VM emulators (gVisor, QEMU), µShield operates via direct cooperation between a privilege-separated user-space daemon (`ushieldd`) and a custom Ring 0 Linux Kernel Module (`ushield.ko`) powered by eBPF LSM hooks.
+
+By collapsing every system boundary—syscalls, file descriptors, filesystem paths, registers, environment variables, and kernel interfaces—into a universal policy matrix, µShield provides gVisor-like virtualization control and Frida-like live dynamic hooking at native Ring 0 execution speed.
 
 ---
 
 ## Architecture Overview
 
 ```text
-┌─────────────────────────────────────────────────────────────────────────┐
-│ USERSPACE (ushieldd - Privilege-Separated Control Engine)               │
-│                                                                         │
-│  ┌─────────────────────────────┐         ┌───────────────────────────┐  │
-│  │ ushieldd-http (Web UI)      │         │ ushieldd-core (Master)    │  │
-│  │ • Unprivileged (UID 1000)   │  socket │ • Master Supervisor (UID 0)  │
-│  │ • Self-Sealed (No /dev access)◄pair──►│ • Handles /dev/ushield    │  │
-│  │ • Exposes HTTP / API        │   IPC   │ • Issues Kernel ioctls    │  │
-│  └─────────────────────────────┘         └─────────────┬─────────────┘  │
-└────────────────────────────────────────────────────────┼────────────────┘
-                                                         │ /dev/ushield
-┌────────────────────────────────────────────────────────┴────────────────┐
-│ KERNELSPACE (ushield.ko - Ring 0 Privileged Control Plane)              │
-│                                                                         │
-│  • Master Supervisor Registration (USHIELD_IOC_REGISTER_SUPERVISOR)     │
-│  • Creator-Scoped Identity & Process Hierarchy Registry                 │
-│  • Lockless Zero-Copy Telemetry Streaming (mmap Ring Buffer)            │
-│  • Granular Syscall Permission Bitmasks (READ, WRITE, EXEC, NET, PROC)  │
-│  • Pre-Exec Child Sealing (First-Instruction Lock Down)                 │
-│  • Real-Time Syscall Interception & Enforcement via eBPF LSM            │
-└─────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ USERSPACE (ushieldd - Privilege-Separated Control & API Engine)             │
+│                                                                             │
+│  ┌─────────────────────────────┐         ┌──────────────────────────────┐   │
+│  │ ushieldd-http (API/Web UI)  │         │ ushieldd-core (Master)       │   │
+│  │ • Unprivileged (UID 33)     │  socket │ • Master Supervisor (UID 0)  │   │
+│  │ • Self-Sealed (No /dev)     │◄─pair──►│ • Handles /dev/ushield       │   │
+│  │ • Exposes HTTP / Web UI     │   IPC   │ • Controls Ring 0 Engine     │   │
+│  └─────────────────────────────┘         └──────────────┬───────────────┘   │
+└─────────────────────────────────────────────────────────┼───────────────────┘
+                                                          │ /dev/ushield
+┌─────────────────────────────────────────────────────────┴───────────────────┐
+│ KERNELSPACE (ushield.ko - Ring 0 Control & Emulation Plane)                 │
+│                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │ LAYERED ENVIRONMENT DEFINITION ENGINE (Base + Stackable Deltas)       │  │
+│  │   [ Base Template ] ──► [ Delta 1: Mounts ] ──► [ Delta 2: Syscalls ] │  │
+│  └──────────────────────────────────┬────────────────────────────────────┘  │
+│                                     │ Evaluates Policy                      │
+│  ┌──────────────────────────────────▼────────────────────────────────────┐  │
+│  │ UNIVERSAL ENFORCEMENT & EMULATION MATRIX                              │  │
+│  │   Primitives: (ALLOW | DENY | HOOK) | LOG                             │  │
+│  │   Targets:    Syscalls, File Descriptors, Files, Memory (mmap), Regs  │  │
+│  └──────────────────────────────────┬────────────────────────────────────┘  │
+│                                     │ Intercepts / Emulates                 │
+│  ┌──────────────────────────────────▼────────────────────────────────────┐  │
+│  │ • Pre-Exec Target Child Sealing (Zero-Instruction Window Lock)        │  │
+│  │ • Synthetic Kernel Emulation & Fault Injection (-EPERM, -ENOENT, Ret) │  │
+│  │ • Real-Time Introspection (mm_struct mmap dump & FD I/O Tapping)      │  │
+│  │ • Event-Driven Dynamic Hot-Patching & Execution Control (Pause/Resume)│  │
+│  │ • Lockless Nanosecond Telemetry Streaming (mmap Ring Buffer)          │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -38,60 +52,77 @@
 
 ### 1. Privilege-Separated User-Space Controller (`ushieldd`)
 
-* **Zero External Dependencies:** Statically linked C11 binary.
-* **Privilege Separation (PrivSep):** The daemon splits into two isolated execution contexts upon launch:
+- **Zero External Dependencies:** Statically linked C11 binary.
+- **Privilege Separation (PrivSep):** The daemon splits into two isolated execution contexts upon launch:
     1. **`ushieldd-core` (Master Supervisor):** Runs as `root` (UID 0), registers with `ushield.ko`, retains exclusive administrative access to `/dev/ushield`, and acts as an internal RPC router.
-    2. **`ushieldd-http` (API/Web UI Worker):** Spawns via `fork()`, drops privileges to an unprivileged user (`nobody`/`uid 1000`), closes `/dev/ushield` descriptors, and self-seals via `USHIELD_IOC_SEAL_SELF`.
-* **Isolated Control IPC:** `ushieldd-http` communicates with `ushieldd-core` strictly across an anonymous `AF_UNIX` `socketpair` IPC bridge. An RCE in the Web stack cannot issue `ioctl` commands or tamper with Ring 0.
-* **Embedded Control Plane:** Embedded Single-Page Web UI served directly from C bytecode. Simple file-based configuration via `ushield.conf`.
+    2. **`ushieldd-http` (API Worker):** Spawns via `fork()`, drops privileges to an unprivileged user (`nobody`/`uid 1000`), closes `/dev/ushield` descriptors, and self-seals via `USHIELD_IOC_SEAL_SELF`.
+- **Isolated Control IPC:** `ushieldd-http` communicates with `ushieldd-core` strictly across an anonymous `AF_UNIX` `socketpair` IPC bridge. An RCE in the Web stack cannot issue `ioctl` commands or tamper with Ring 0.
+- **Embedded Control Plane:** Embedded Single-Page Web UI served directly from C bytecode. Simple file-based configuration via `ushield.conf`.
 
-### 2. Micro-Container & Asymmetric Namespace Isolation
+### 2. Layered Environment Engine (Base Templates + Delta Layers)
 
-* **Asymmetric Visibility:** Target binaries execute within hyper-restricted, custom Linux namespaces (`CLONE_NEWPID`, `CLONE_NEWNET`, `CLONE_NEWNS`).
-* **Target View:** Fully configurable process illusion, presenting execution environments as stripped-down bare kernels or full, standard Linux servers via custom `rootfs` profiles.
-* **Controller View:** `ushieldd-core` retains top-down supervisor visibility into containerized processes for real-time monitoring, signal handling, and telemetry streaming.
+- **Base Layers:** Environments are constructed starting from a fundamental host visibility profile:
+  - `USHIELD_BASE_BARE`: Empty root filesystem with minimal standard dev stubs.
+  - `USHIELD_BASE_MINIMAL`: Stripped distribution base containing essential runtime libraries (`glibc`).
+  - `USHIELD_BASE_HOST_REFLECT`: Full host system reflection with read-only copy-on-write (COW) file semantics.
+- **Stackable Delta Layers:** Sequential, non-destructive modifications stacked on top of the base layer:
+  - Dynamic mount additions/masking (e.g. mask `/etc/shadow`, isolate `/tmp` as `tmpfs`).
+  - Environment variable filter/injection lists.
+  - Asymmetric namespace isolation (`CLONE_NEWPID`, `CLONE_NEWNET`, `CLONE_NEWNS`).
 
-### 3. Ring 0 Kernel Driver & Telemetry (`ushield.ko`)
+### 3. Universal Policy Matrix: `(ALLOW | DENY | HOOK) | LOG`
 
-* **Zero-Copy IPC Telemetry:** Direct `/dev/ushield` character device offering contiguous `mmap` ring buffers for lockless, nanosecond telemetry streaming directly into user space.
-* **Master Supervisor Security:** `USHIELD_IOC_REGISTER_SUPERVISOR` locks administrative capabilities to the verified master daemon PID.
-* **Granular Category Sealing:** Replaces blanket locks with bitmask permission profiles:
-    1. `USHIELD_PERM_READ`: File read operations.
-    2. `USHIELD_PERM_WRITE`: File write operations.
-    3. `USHIELD_PERM_EXEC`: Binary execution (`execve`).
-    4. `USHIELD_PERM_NET`: Network socket creation, binding, and connecting.
-    5. `USHIELD_PERM_PROCESS`: Process lifecycle management (`fork`/`clone`).
-* **Creator-Scoped Access Control:** Ring 0 identity registry enforces an access matrix based on process hierarchy (`task_struct->real_parent`), ensuring target policies are accessible only by the process itself, its creator PID, or the Master Supervisor.
-* **Pre-Exec Child Sealing:** Enforces sandbox policies before a child process executes its first assembly instruction (`_start`), eliminating TOCTOU race conditions during startup.
+Every monitored resource (Syscalls, File Descriptors, Filesystem Paths, Registers, Kernel Interfaces) is governed by an orthogonal 2-bit action tuple:
+- **`ALLOW`**: Permit operation to pass down to the host Linux kernel.
+- **`DENY`**: Intercept and block operation (default action: send `SIGKILL` or return custom `override_errno` such as `-EPERM`, `-EACCES`, or `-ENOENT`).
+- **`HOOK`**: Bypass host kernel implementation entirely and dispatch to custom Ring 0 emulation handlers, synthesizing responses or injecting emulated state.
+- **`LOG`** (Bitwise Flag): Stream zero-copy nanosecond telemetry events to user space regardless of the action taken.
+
+### 4. Synthetic Kernel Emulation & Inline Fault Injection
+
+- **Host Kernel Exploit Mitigation:** Mitigates kernel-sharing vulnerabilities inherent to Docker/containerd. Untrusted binaries calling risky or un-vetted kernel subsystems (e.g., `io_uring`, `bpf`) are trapped in Ring 0 and answered by synthetic emulation handlers without ever executing host kernel code paths.
+- **Programmable Fault Injection & Software Fuzzing:** Stress-test binary error-handling paths by dynamically forcing syscall failure states, injecting custom return codes, or simulating hardware I/O failures.
+
+### 5. Ring 0 Introspection & Event-Driven Hot-Patching
+
+- **Live Execution Control:** Atomic `USHIELD_IOC_PAUSE_TARGET` and `USHIELD_IOC_RESUME_TARGET` control allows supervisors to freeze target binaries mid-execution (`SIGSTOP`/LSM hold) for deep inspection.
+- **Deep Memory & FD Visibility:** Full visibility into target process memory structures (`task_struct->mm->mmap`) and file descriptor tables (`files_struct`), enabling live memory dumps and transparent I/O tapping across `stdin`, `stdout`, `stderr`, and network sockets.
+- **Stateful Hot-Patching:** Dynamic policy updates in Ring 0 based on runtime telemetry triggers (e.g., automatically transition a syscall rule from `ALLOW` to `HOOK` after $N$ calls).
 
 ---
 
 ## API & Control Capabilities
 
-The REST API (and matching Web UI) exposes operational control over the engine:
+The REST API (and matching Web UI) exposes complete control over the sandbox engine:
 
 | Endpoint Group | Description |
 | --- | --- |
-| **`POST /api/auth/login`** | Authenticates against `ushield.conf` creds; returns a session token. |
-| **`POST /api/binary/upload`** | Uploads target ELF binaries for sandbox execution. |
+| **`POST /api/auth/login`** | Authenticates against `ushield.conf` creds; returns session token. |
+| **`POST /api/binary/upload`** | Uploads target ELF binaries for sandboxed execution. |
 | **`GET /api/binary/download`** | Retrieves stored binaries or execution artifacts. |
-| **`POST /api/sandbox/create`** | Configures permission bitmasks, namespace masks, and mount points. |
+| **`POST /api/sandbox/create`** | Configures base templates, stackable delta layers, and universal policy matrices. |
 | **`POST /api/sandbox/execute`** | Spawns sandboxed execution with pre-exec sealing and real-time telemetry streaming. |
-| **`GET /api/telemetry/stats`** | Fetches low-latency ring buffer metrics and intercepted syscall logs. |
+| **`POST /api/sandbox/pause`** | Freezes a target process mid-execution (`SIGSTOP`) for live memory inspection. |
+| **`POST /api/sandbox/resume`** | Resumes execution of a paused target process (`SIGCONT`). |
+| **`POST /api/sandbox/hotpatch`** | Dynamically updates target rule matrices in Ring 0 while process is running. |
+| **`GET /api/telemetry/stats`** | Fetches low-latency ring buffer metrics and intercepted syscall/emulation logs. |
 | **`WS /api/sandbox/attach`** | Interactive real-time stream directly into running sandboxes. |
 
 ---
 
-## Development Roadmap & Future Architecture
+## Development Roadmap
 
-* [x] **Phase 0:** Project layout, Makefile build system, and isolated QEMU/KVM dev VM setup.
-* [x] **Phase 1:** Core LKM skeleton (`ushield.ko`) & character device registration (`/dev/ushield`).
-* [ ] **Phase 2:** Bare-metal C daemon (`ushieldd`), `ushield.conf` parser, and embedded Web UI.
-* [x] **Phase 3:** Zero-copy `mmap` ring buffer telemetry transport.
-* [x] **Phase 4:** PrivSep daemon split, process hierarchy identity registry, and granular process sealing (`USHIELD_IOC_SEAL_SELF`, `USHIELD_IOC_REGISTER_TARGET`).
-* [ ] **Phase 5:** eBPF LSM syscall filtering (Category rules & explicit whitelists/blacklists).
-* [ ] **Phase 6 (Future):** *Behavioral Sequence Filtering* — Advanced workflow state machines in Ring 0 to evaluate execution sequences (e.g., allow `sys_A`, but terminate if followed immediately by `sys_B`).
-* [ ] **Phase 7 (Future):** HTTP library replaced by [`asmhttp`](https://github.com/tralsesec/asmhttp) when ready for production.
+- [x] **Phase 0:** Project layout, Makefile build system, and isolated QEMU/KVM dev VM setup.
+- [x] **Phase 1:** Core LKM skeleton (`ushield.ko`) & character device registration (`/dev/ushield`).
+- [ ] **Phase 2:** Bare-metal C daemon (`ushieldd`), `ushield.conf` parser, and embedded Web UI.
+- [x] **Phase 3:** Zero-copy `mmap` ring buffer telemetry transport.
+- [x] **Phase 4:** PrivSep daemon split, process hierarchy identity registry, and path-based target registration (`USHIELD_IOC_REGISTER_TARGET`).
+- [ ] **Phase 5:** Universal Policy Matrix `(ALLOW | DENY | HOOK) | LOG` & eBPF LSM syscall interception engine.
+- [ ] **Phase 6:** Layered Environment Engine (Base Templates + Delta Layer Mount/Env stacker).
+- [ ] **Phase 7:** Synthetic Kernel Emulation & Inline Fault Injection Engine (`DENY_ERRNO`, `EMULATE`).
+- [ ] **Phase 8:** Ring 0 Target Introspection (VMA mmap dumping, FD tapping, atomic Pause/Resume).
+- [ ] **Phase 9 (Future):** *Behavioral Sequence State Machines* — Ring 0 workflow triggers (e.g. stateful hot-patching when Syscall A is followed by Syscall B).
+- [ ] **Phase 10 (Future):** HTTP library replaced by [`asmhttp`](https://github.com/tralsesec/asmhttp) for zero-dependency production builds.
 
 ---
 
