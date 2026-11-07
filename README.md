@@ -136,13 +136,13 @@ The REST API (and matching Web UI) exposes complete control over the sandbox eng
 
 - [x] **Phase 0:** Project layout, Makefile build system, and isolated QEMU/KVM dev VM setup.
 - [x] **Phase 1:** Core LKM skeleton (`ushield.ko`) & character device registration (`/dev/ushield`).
+- [ ] **Phase 2:** Bare-metal C daemon (`ushieldd`), `ushield.conf` parser, and embedded Web UI.
 - [x] **Phase 3:** Zero-copy `mmap` ring buffer telemetry transport.
 - [x] **Phase 4:** PrivSep daemon split, process hierarchy identity registry, and path-based target registration (`USHIELD_IOC_REGISTER_TARGET`).
 - [ ] **Phase 5:** Universal Policy Matrix `(ALLOW | DENY | HOOK) | LOG` & eBPF LSM syscall interception with Ring 3 Upcall Hook Dispatcher (`USHIELD_IOC_REGISTER_HOOK` + `ushield_hook_ctx` loop).
 - [ ] **Phase 6:** Layered Environment Engine (Base Templates + Delta Layer Mount/Env stacker).
 - [ ] **Phase 7:** Synthetic Kernel Emulation & Inline Fault Injection Engine (`DENY_ERRNO`, `EMULATE`).
 - [ ] **Phase 8:** Ring 0 Target Introspection (VMA mmap dumping, FD tapping, atomic Pause/Resume).
-- [ ] **Phase 2:** Bare-metal C daemon (`ushieldd`), `ushield.conf` parser, and embedded Web UI.
 - [ ] **Phase 9 (Future):** *Behavioral Sequence State Machines* — Ring 0 workflow triggers (e.g. stateful hot-patching when Syscall A is followed by Syscall B).
 - [ ] **Phase 10 (Future):** HTTP library replaced by [`asmhttp`](https://github.com/tralsesec/asmhttp) for zero-dependency production builds.
 
